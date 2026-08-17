@@ -1,0 +1,23 @@
+# Cross-platform, always needed
+requests>=2.31,<3
+pystray>=0.19,<1        # tray icon
+# No upper bound -- an old, narrow range here (e.g. "<11") is exactly what
+# forces pip to install a Pillow build old enough to predate whatever
+# Python version is actually running, which then has no prebuilt wheel
+# for it and tries (and fails) to compile from source. Pillow adds
+# support for new CPython releases fast; always taking the newest
+# available build is what actually stays compatible with new Python
+# versions, not pinning to an older range "for safety."
+Pillow>=10.0             # tray icon image (pystray dependency)
+
+# Windows only -- install with: pip install -r requirements-windows.txt
+# (see requirements-windows.txt)
+
+# macOS only -- install with: pip install -r requirements-macos.txt
+# (see requirements-macos.txt)
+
+# Linux: no extra Python packages required. Foreground-window/idle detection
+# instead shells out to xdotool/wmctrl/xprintidle -- install via your distro's
+# package manager, e.g.:
+#   sudo apt install xdotool xprintidle       # Debian/Ubuntu
+#   sudo dnf install xdotool xprintidle        # Fedora

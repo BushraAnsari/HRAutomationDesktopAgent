@@ -1,0 +1,68 @@
+name: Build Desktop Agent
+
+# Runs automatically on every push, and can also be triggered manually
+# from the Actions tab ("Run workflow" button) -- no local commands, no
+# terminal, no Python install on your own machine at all. GitHub runs
+# real Windows and macOS virtual machines for this; that's what actually
+# lets a Windows .exe and a macOS .app both get built without you owning
+# either kind of machine yourself.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-windows.txt
+          pip install pyinstaller
+
+      - name: Build .exe
+        run: pyinstaller packaging/agent.spec
+
+      - name: Upload built .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: HRActivityAgent-Windows
+          path: dist/HRActivityAgent/
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt -r requirements-macos.txt
+          pip install pyinstaller
+
+      - name: Build .app
+        run: pyinstaller packaging/agent.spec
+
+      - name: Zip the .app bundle
+        # Uploading a raw .app directory as a GitHub artifact strips its
+        # executable bit and bundle structure when zipped by GitHub's own
+        # upload step -- zipping it ourselves first with ditto (the
+        # macOS-native tool for this, not plain zip) preserves both.
+        run: ditto -c -k --sequesterRsrc --keepParent dist/HRActivityAgent.app HRActivityAgent-macOS.zip
+
+      - name: Upload built .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: HRActivityAgent-macOS
+          path: HRActivityAgent-macOS.zip
+          if-no-files-found: error
