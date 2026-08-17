@@ -150,6 +150,17 @@ class AgentRuntime:
 
             interval_seconds = (self._server_config or {}).get("heartbeatIntervalSeconds", 120)
             try:
+                # heartbeat() first -- it's the one call that actually
+                # updates lastSeenAt server-side (see agent.service.js's
+                # own heartbeat() vs getConfig(), which never touches it).
+                # Without this, the dashboard's own "Online/Offline"
+                # status only ever updated whenever a sync happened to
+                # fire (every syncIntervalSeconds, and only while an
+                # active session exists to sync against) -- an agent that
+                # was genuinely still running could sit there reading
+                # "Offline" for the better part of an hour, which is
+                # exactly the bug this fixes.
+                self.api_client.heartbeat()
                 self._server_config = self.api_client.get_config()
                 self.config.set("monitoring_active", self._server_config["monitoringActive"])
                 attendance_id = self._server_config.get("attendanceId")
