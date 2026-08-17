@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from . import config as config_module
 from . import pairing
 from .autostart import ensure_autostart_registered
+from .singleinstance import ensure_single_instance
 from .api_client import ApiClient, ApiError
 from .monitor.aggregator import ActivityAggregator
 from .monitor.collector_base import get_collector
@@ -50,6 +51,14 @@ class AgentRuntime:
     def __init__(self):
         self.config = config_module.AgentConfig()
         _setup_logging(config_module.LOG_PATH)
+
+        # As early as possible -- before the tray icon, before anything
+        # else -- so a still-running previous instance (very easy to end
+        # up with during testing: a crashed/errored run whose process
+        # kept going anyway) gets stopped before this one claims the
+        # same tray icon, same PID file, same everything.
+        ensure_single_instance(config_module.PID_PATH)
+
         store.init_db(config_module.DB_PATH)
 
         self.api_client = ApiClient(self.config)

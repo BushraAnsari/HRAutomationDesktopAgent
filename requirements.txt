@@ -9,6 +9,11 @@ pystray>=0.19,<1        # tray icon
 # available build is what actually stays compatible with new Python
 # versions, not pinning to an older range "for safety."
 Pillow>=10.0             # tray icon image (pystray dependency)
+# Cross-platform (not just Windows) -- used by singleinstance.py to
+# detect/stop a still-running previous copy of the agent on any OS, not
+# only for the Windows-specific foreground-window detection this used to
+# be scoped to.
+psutil>=5.9
 
 # Windows only -- install with: pip install -r requirements-windows.txt
 # (see requirements-windows.txt)

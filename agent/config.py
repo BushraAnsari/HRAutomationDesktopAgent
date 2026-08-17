@@ -38,6 +38,10 @@ def get_app_data_dir() -> Path:
 CONFIG_PATH = get_app_data_dir() / "config.json"
 DB_PATH = get_app_data_dir() / "activity_queue.sqlite3"
 LOG_PATH = get_app_data_dir() / "agent.log"
+# See singleinstance.py's own ensure_single_instance -- this is what
+# lets a new launch find and stop a still-running previous one, instead
+# of the two just piling up side by side.
+PID_PATH = get_app_data_dir() / "agent.pid"
 
 DEFAULTS = {
     # Set once at install time (see packaging/README) or by an admin --

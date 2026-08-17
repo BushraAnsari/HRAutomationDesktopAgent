@@ -1,8 +1,4 @@
 -r requirements.txt
-# No upper bound -- same reasoning as requirements.txt's own Pillow
-# comment: an old capped range is what forces pip into a build too old
-# to have a wheel for whatever Python version is actually running.
-psutil>=5.9
 # pywin32 is not actually imported directly (collector_windows.py uses
 # plain ctypes for GetForegroundWindow/GetLastInputInfo, which needs no
 # extra package), but PyInstaller's own Windows hooks work more reliably
