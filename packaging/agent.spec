@@ -10,7 +10,14 @@ import sys
 block_cipher = None
 
 a = Analysis(
-    ["../agent/main.py"],
+    # ../run.py, not ../agent/main.py -- agent/main.py uses relative
+    # imports throughout the package, which only resolve when "agent" is
+    # imported as a real package. Pointing Analysis directly at
+    # agent/main.py instead runs it as the top-level script itself, which
+    # has no parent package context at all -- see run.py's own comment
+    # for the exact failure this caused ("attempted relative import with
+    # no known parent package") before this was fixed.
+    ["../run.py"],
     pathex=["../"],
     binaries=[],
     datas=[],
