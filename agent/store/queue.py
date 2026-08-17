@@ -102,16 +102,30 @@ def mark_synced(db_path, ids: list):
 
 def to_api_payload(row: dict) -> dict:
     """Row -> exactly the shape agent.validation.js's `activityEvent`
-    schema expects on the server."""
-    return {
+    schema expects on the server. Optional fields are OMITTED entirely
+    when unset, not sent as JSON null -- an IDLE interval has no
+    application/window title at all (see monitor/aggregator.py's own
+    "no app identity while idle" comment), which is a completely normal,
+    expected case, but the server's own zod schema marks these fields
+    `.optional()` -- which only ever means "the key can be missing," not
+    "the key can be null". Sending null was being rejected as a
+    validation error on every single batch that included even one idle
+    interval, which is most of them."""
+    payload = {
         "activityType": row["activity_type"],
-        "application": row.get("application"),
-        "applicationDisplayName": row.get("application_display_name"),
-        "windowTitle": row.get("window_title"),
         "startedAt": row["started_at"],
         "endedAt": row["ended_at"],
         "durationSeconds": row["duration_seconds"],
     }
+    for local_key, api_key in (
+        ("application", "application"),
+        ("application_display_name", "applicationDisplayName"),
+        ("window_title", "windowTitle"),
+    ):
+        value = row.get(local_key)
+        if value is not None:
+            payload[api_key] = value
+    return payload
 
 
 def purge_synced_older_than(db_path, days=14):

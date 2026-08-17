@@ -210,6 +210,14 @@ class AgentRuntime:
         attendance_id = self.config.get("current_attendance_id")
         if attendance_id:
             threading.Thread(target=lambda: self.sync_service.sync_pending(attendance_id, is_final=False), daemon=True).start()
+        else:
+            # Previously a silent no-op -- indistinguishable from "synced
+            # successfully and there was simply nothing new," which is
+            # exactly the confusing symptom of clicking this and nothing
+            # ever changing. Logged now so that distinction is at least
+            # visible in agent.log, even though the tray menu itself has
+            # nowhere to show a message directly.
+            logger.warning("Retry sync requested, but no current attendance session is recorded -- is this device actually checked in?")
 
     def _flush_and_sync_if_active(self):
         closed = self.aggregator.flush()
