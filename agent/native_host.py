@@ -17,8 +17,16 @@ a small status file to the SAME app-data directory the rest of this
 agent already uses (see config.get_app_data_dir), and responds so Chrome
 considers the connection healthy. Deliberately dumb -- never talks to
 the running agent process directly (no socket, no shared memory); the
-agent's own sampling loop (see monitor/browser_meeting_detector.py)
-picks this file up on its next cycle.
+agent's own sampling loop (see monitor/browser_meeting_detector.py and
+monitor/browser_domain_detector.py) picks these files up on its next
+cycle.
+
+Two separate status files, not one merged file -- background.js's own
+domain-tracking and content_script.js's own meeting-detection are
+genuinely different concerns updated on different, independent
+schedules; keeping them apart avoids any read-modify-write merge logic
+here (this process only ever needs to write whichever one this specific
+message is actually about).
 """
 import json
 import logging
@@ -55,7 +63,9 @@ def run_native_host():
     than doing anything else this agent normally does (no tray icon, no
     sampling loops, no server heartbeats -- this is a completely
     separate, short-lived process each time Chrome starts it)."""
-    status_path = config_module.get_app_data_dir() / "browser_meeting_status.json"
+    meeting_status_path = config_module.get_app_data_dir() / "browser_meeting_status.json"
+    domain_status_path = config_module.get_app_data_dir() / "browser_domain_status.json"
+
     while True:
         try:
             message = _read_message()
@@ -64,14 +74,29 @@ def run_native_host():
         if message is None:
             break
 
-        status = {
-            "in_meeting": bool(message.get("inMeeting")),
-            "app": message.get("app") or None,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        try:
-            status_path.write_text(json.dumps(status))
-        except OSError:
-            pass  # best-effort -- a failed write here shouldn't crash the host
+        # background.js's own domain-tracking messages are shaped
+        # {"domain": "..."} -- distinguished from meeting-status messages
+        # ({"inMeeting": bool, "app": ...}) by which key is actually
+        # present, since both share this same connection.
+        if "domain" in message:
+            domain_status = {
+                "domain": message.get("domain") or None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                domain_status_path.write_text(json.dumps(domain_status))
+            except OSError:
+                pass  # best-effort -- a failed write here shouldn't crash the host
+        else:
+            meeting_status = {
+                "in_meeting": bool(message.get("inMeeting")),
+                "app": message.get("app") or None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                meeting_status_path.write_text(json.dumps(meeting_status))
+            except OSError:
+                pass  # best-effort -- a failed write here shouldn't crash the host
 
         _send_message({"ok": True})
+

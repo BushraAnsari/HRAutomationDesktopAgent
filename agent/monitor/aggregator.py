@@ -26,26 +26,37 @@ class ActivityAggregator:
         progress."""
         self.idle_threshold_seconds = seconds
 
-    def add_sample(self, foreground_app, idle_seconds: float):
+    def add_sample(self, foreground_app, idle_seconds: float, domain=None):
         """foreground_app is a collector_base.ForegroundApp or None.
-        Returns a completed interval dict (ready for store.queue.enqueue_event)
-        if this sample closed one, else None."""
+        domain is the current browser tab's domain (e.g. "google.com"),
+        passed in from main.py's own _take_sample only when the
+        foreground app is a recognized browser -- None for every other
+        app, and always None while idle, the same "no app identity while
+        idle" reasoning app_key itself already follows. A domain change
+        closes the current interval exactly the same way an app change
+        does (switching from google.com to chatgpt.com within the same
+        chrome.exe process is a real change worth its own row, even
+        though the executable never changes). Returns a completed
+        interval dict (ready for store.queue.enqueue_event) if this
+        sample closed one, else None."""
         activity_type = "IDLE" if idle_seconds >= self.idle_threshold_seconds else "ACTIVE"
         # No app identity distinction while idle -- "which app was in the
         # background while nobody touched the keyboard" isn't a
         # meaningful signal the spec asks for; every IDLE interval has
         # application=None regardless of what's behind it.
         app_key = None if activity_type == "IDLE" else (foreground_app.executable_name if foreground_app else None)
+        domain_key = domain if activity_type == "ACTIVE" else None
 
         now = _now_iso()
 
         if self._current is None:
-            self._start_interval(activity_type, app_key, foreground_app, now)
+            self._start_interval(activity_type, app_key, domain_key, foreground_app, now)
             return None
 
         same_interval = (
             self._current["activity_type"] == activity_type
             and self._current["_app_key"] == app_key
+            and self._current["_domain_key"] == domain_key
         )
 
         if same_interval:
@@ -55,7 +66,7 @@ class ActivityAggregator:
         # The interval just changed -- close out the previous one and
         # start a fresh one from this sample.
         closed = self._close_interval(now)
-        self._start_interval(activity_type, app_key, foreground_app, now)
+        self._start_interval(activity_type, app_key, domain_key, foreground_app, now)
         return closed
 
     def flush(self):
@@ -66,13 +77,15 @@ class ActivityAggregator:
             return None
         return self._close_interval(_now_iso())
 
-    def _start_interval(self, activity_type, app_key, foreground_app, started_at):
+    def _start_interval(self, activity_type, app_key, domain_key, foreground_app, started_at):
         self._current = {
             "activity_type": activity_type,
             "_app_key": app_key,
+            "_domain_key": domain_key,
             "application": app_key,
             "application_display_name": foreground_app.display_name if foreground_app else None,
             "window_title": foreground_app.window_title if foreground_app else None,
+            "domain": domain_key,
             "started_at": started_at,
             "ended_at": started_at,
         }
@@ -84,6 +97,7 @@ class ActivityAggregator:
         ended = datetime.fromisoformat(interval["ended_at"])
         interval["duration_seconds"] = max(0.0, (ended - started).total_seconds())
         interval.pop("_app_key", None)
+        interval.pop("_domain_key", None)
         self._current = None
         # Sub-second intervals (a window flicker, a sample landing right
         # at a transition) aren't worth a whole database row -- discarded

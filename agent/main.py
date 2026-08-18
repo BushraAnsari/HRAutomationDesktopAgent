@@ -19,7 +19,14 @@ import logging.handlers
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+# Windows-only, used solely by _get_tick_count_ms below -- imported at
+# module load time rather than lazily inside that method, since it's a
+# standard-library module always present on Windows (ctypes itself is
+# cross-platform; only the windll attribute accessed inside that method
+# is Windows-specific).
+import ctypes
 
 from . import config as config_module
 from . import pairing
@@ -152,7 +159,120 @@ class AgentRuntime:
                 self._take_sample()
             time.sleep(interval_seconds)
 
+    # How much bigger than a normal poll interval a gap needs to be
+    # before it's treated as "the process wasn't running" rather than
+    # ordinary scheduling jitter (a slow tick, a GC pause) -- poll
+    # intervals are always a handful of seconds (2-10s, admin-
+    # configured), so 90 seconds sits comfortably above any of that
+    # while still catching genuine gaps (sleep, shutdown, a crash), which
+    # realistically are always minutes long at minimum.
+    OFFLINE_GAP_THRESHOLD_SECONDS = 90
+    # Small enough to ignore ordinary clock/tick drift between the two
+    # counters (they're not perfectly synchronized even in normal
+    # operation), large enough that a real sleep period is never missed
+    # -- actual sleeps are realistically always many seconds at minimum.
+    SLEEP_PORTION_THRESHOLD_SECONDS = 5
+
+    @staticmethod
+    def _get_tick_count_ms():
+        """Milliseconds since this boot -- GetTickCount64 specifically
+        does NOT advance while the system is asleep/hibernating (unlike
+        the wall clock, which keeps moving), which is exactly what makes
+        it possible to tell "the system was asleep for X seconds" apart
+        from "the system was awake the whole time but this agent simply
+        wasn't sampling" (a real problem worth flagging, not normal idle
+        time). Windows-only for now -- returns None elsewhere, in which
+        case _check_for_offline_gap falls back to treating any gap as
+        sleep-equivalent rather than attempting a split it can't measure."""
+        if sys.platform != "win32":
+            return None
+        try:
+            return ctypes.windll.kernel32.GetTickCount64()
+        except Exception:  # noqa: BLE001 -- must never crash sampling over a diagnostic call
+            return None
+
+    def _check_for_offline_gap(self):
+        """Compares now against the last sample this agent ever took,
+        persisted across restarts (see config.py's own generic get/set) --
+        catches sleep, shutdown, a crash, or the agent simply being
+        closed and reopened later. Splits the gap into two different
+        things, not one: time the system was genuinely asleep/shut down
+        (folded into IDLE -- the person wasn't working, same as sitting
+        idle) versus time the system was awake but this agent specifically
+        wasn't sampling (kept as OFFLINE/untracked -- a real problem with
+        the tool itself, not a normal break). GetTickCount64 is what
+        makes the split possible: it pauses during sleep, the wall clock
+        doesn't, so the DIFFERENCE between how much wall-clock time
+        passed and how much tick-count time passed is exactly how long
+        the system was actually asleep for."""
+        now = datetime.now(timezone.utc)
+        last_sample_at_str = self.config.get("last_sample_at")
+        last_tick_count = self.config.get("last_sample_tick_count")
+        current_tick_count = self._get_tick_count_ms()
+
+        if last_sample_at_str:
+            try:
+                last_sample_at = datetime.fromisoformat(last_sample_at_str)
+                wall_gap_seconds = (now - last_sample_at).total_seconds()
+
+                if wall_gap_seconds > self.OFFLINE_GAP_THRESHOLD_SECONDS:
+                    attendance_id = self.config.get("current_attendance_id")
+                    if attendance_id:
+                        if last_tick_count is not None and current_tick_count is not None and current_tick_count >= last_tick_count:
+                            tick_gap_seconds = (current_tick_count - last_tick_count) / 1000
+                            asleep_seconds = max(0.0, wall_gap_seconds - tick_gap_seconds)
+                        else:
+                            # Tick count went backwards -- a reboot
+                            # happened (this boot's own "time since
+                            # start" reset to near-zero), or tick
+                            # counting isn't available on this platform.
+                            # Either way, "how long was it awake during
+                            # this specific gap" isn't answerable, so the
+                            # whole gap is treated as sleep/shutdown-
+                            # equivalent rather than guessed at.
+                            asleep_seconds = wall_gap_seconds
+
+                        awake_untracked_seconds = wall_gap_seconds - asleep_seconds
+
+                        # Sleep portion placed first, untracked portion
+                        # last -- an approximation (the exact moment
+                        # within the gap that sleep started isn't
+                        # observable from two endpoint samples alone),
+                        # but a reasonable one: an agent hiccup right
+                        # before a scheduled sleep is a far more typical
+                        # real-world sequence than the reverse.
+                        cursor = last_sample_at
+                        if asleep_seconds > self.SLEEP_PORTION_THRESHOLD_SECONDS:
+                            sleep_end = cursor + timedelta(seconds=asleep_seconds)
+                            store.enqueue_event(config_module.DB_PATH, attendance_id, {
+                                "activity_type": "IDLE",
+                                "application": None,
+                                "application_display_name": None,
+                                "window_title": None,
+                                "started_at": cursor.isoformat(),
+                                "ended_at": sleep_end.isoformat(),
+                                "duration_seconds": asleep_seconds,
+                            })
+                            cursor = sleep_end
+                        if awake_untracked_seconds > self.OFFLINE_GAP_THRESHOLD_SECONDS:
+                            store.enqueue_event(config_module.DB_PATH, attendance_id, {
+                                "activity_type": "OFFLINE",
+                                "application": None,
+                                "application_display_name": None,
+                                "window_title": None,
+                                "started_at": cursor.isoformat(),
+                                "ended_at": now.isoformat(),
+                                "duration_seconds": awake_untracked_seconds,
+                            })
+            except ValueError:
+                pass  # a corrupted/malformed timestamp must never crash sampling -- just skip detection this once
+
+        self.config.set("last_sample_at", now.isoformat())
+        if current_tick_count is not None:
+            self.config.set("last_sample_tick_count", current_tick_count)
+
     def _take_sample(self):
+        self._check_for_offline_gap()
         try:
             foreground = self.collector.get_foreground_app()
             idle_seconds = self.collector.get_idle_seconds()
@@ -160,7 +280,22 @@ class AgentRuntime:
             logger.warning("Sample failed: %s", err)
             return
 
-        closed_interval = self.aggregator.add_sample(foreground, idle_seconds)
+        # Only meaningful for a recognized browser -- checked here, not
+        # inside the aggregator itself, so the aggregator never needs to
+        # know which executables happen to be browsers at all. Read from
+        # the same status file background.js's own domain-tracking
+        # writes to (see browser_domain_detector.py's own comment for why
+        # that has to come from the browser extension rather than
+        # anything this agent could determine on its own).
+        domain = None
+        if foreground and foreground.executable_name and foreground.executable_name.lower() in ("chrome.exe", "msedge.exe", "firefox.exe"):
+            try:
+                from .monitor.browser_domain_detector import detect_browser_domain
+                domain = detect_browser_domain(config_module.get_app_data_dir() / "browser_domain_status.json")
+            except Exception as err:  # noqa: BLE001 -- a failed domain check must never kill the sampling thread
+                logger.warning("Browser domain detection failed: %s", err)
+
+        closed_interval = self.aggregator.add_sample(foreground, idle_seconds, domain=domain)
         if closed_interval:
             attendance_id = self.config.get("current_attendance_id")
             if attendance_id:
