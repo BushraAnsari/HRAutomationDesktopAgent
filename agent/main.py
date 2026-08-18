@@ -24,10 +24,12 @@ from datetime import datetime, timezone
 from . import config as config_module
 from . import pairing
 from .autostart import ensure_autostart_registered
+from .browser_bridge_setup import ensure_browser_bridge_registered
 from .singleinstance import ensure_single_instance
 from .api_client import ApiClient, ApiError
 from .monitor.aggregator import ActivityAggregator
 from .monitor.collector_base import get_collector
+from .monitor.meeting_aggregator import MeetingAggregator
 from .store import queue as store
 from .sync.sync_service import SyncService
 from .tray import TrayIcon, STATUS_MONITORING, STATUS_CHECKED_OUT, STATUS_NOT_PAIRED
@@ -65,8 +67,18 @@ class AgentRuntime:
         self.sync_service = SyncService(self.config, self.api_client, config_module.DB_PATH)
         self.collector = get_collector()
         self.aggregator = ActivityAggregator(idle_threshold_seconds=300)
+        # Separate from the collector/aggregator above -- this checks
+        # ALL open windows, not just the foreground one, specifically so
+        # a Zoom/Teams desktop call is still counted while someone's
+        # foreground window is something else entirely. Windows-only for
+        # now (see meeting_detector.py's own comment); silently does
+        # nothing on other platforms rather than erroring.
+        self.meeting_aggregator = MeetingAggregator()
 
-        self.tray = TrayIcon(on_retry_sync=self._manual_retry_sync, on_quit=self._quit)
+        self.tray = TrayIcon(
+            on_retry_sync=self._manual_retry_sync,
+            on_quit=self._quit,
+        )
         self._stop_event = threading.Event()
         self._server_config = None  # last successfully-fetched /agent/config response
 
@@ -80,6 +92,16 @@ class AgentRuntime:
         # an employee ever has to do: run the exe once, enter the code,
         # done. No IT-run schtasks command needed per machine.
         ensure_autostart_registered()
+
+        # Registers the browser-meeting native messaging bridge with
+        # Chrome, fully automatically -- see browser_bridge_setup.py's
+        # own comment for why this needs no prompt at all: the
+        # extension's manifest.json embeds a fixed key, giving it a
+        # permanent, already-known ID, so there is nothing left for a
+        # person to look up or paste in. A no-op after the first run
+        # (and a no-op entirely on macOS/Linux, not wired into this
+        # automatic flow yet).
+        ensure_browser_bridge_registered()
 
         if not self.collector.is_available():
             logger.warning(
@@ -144,6 +166,38 @@ class AgentRuntime:
             if attendance_id:
                 store.enqueue_event(config_module.DB_PATH, attendance_id, closed_interval)
 
+        # Meeting presence -- checked independently of the foreground
+        # sample above (see MeetingAggregator's own comment for why: a
+        # meeting can be genuinely ongoing in a window that isn't
+        # focused at all). Two sources feed the same aggregator: desktop
+        # meeting apps (Windows-only, all-window enumeration -- see
+        # meeting_detector.py) and browser-based meetings (Google Meet,
+        # Teams-in-browser -- see browser_meeting_detector.py, fed by the
+        # separate Chrome extension + native messaging bridge project).
+        # Desktop apps are checked first; if genuinely both were
+        # somehow active at once, only one meeting is realistically
+        # happening, so whichever is found first wins for this sample.
+        app_name = None
+        if sys.platform == "win32":
+            try:
+                from .monitor.meeting_detector import detect_meeting
+                app_name, _title = detect_meeting()
+            except Exception as err:  # noqa: BLE001 -- a single bad check must never kill the sampling thread
+                logger.warning("Desktop meeting detection failed: %s", err)
+
+        if not app_name:
+            try:
+                from .monitor.browser_meeting_detector import detect_browser_meeting
+                app_name, _title = detect_browser_meeting(config_module.get_app_data_dir() / "browser_meeting_status.json")
+            except Exception as err:  # noqa: BLE001
+                logger.warning("Browser meeting detection failed: %s", err)
+
+        closed_meeting = self.meeting_aggregator.add_sample(app_name)
+        if closed_meeting:
+            attendance_id = self.config.get("current_attendance_id")
+            if attendance_id:
+                store.enqueue_event(config_module.DB_PATH, attendance_id, closed_meeting)
+
     def _heartbeat_loop(self):
         """The one place this agent calls the server on a short,
         recurring cadence while checked in -- a handful of small requests
@@ -181,6 +235,18 @@ class AgentRuntime:
                     # out, possibly from elsewhere) -- finalize locally
                     # exactly as if check-out had been detected directly.
                     self._flush_and_sync_if_active()
+
+                if self._server_config.get("forceSyncNow"):
+                    # HR clicked "Request sync now" on the Team Activity
+                    # page (see agent.service.js's own requestSyncNow) --
+                    # this is the one-shot flag it sets, picked up here on
+                    # whatever heartbeat happens to come next rather than
+                    # instantly, since there's no persistent connection to
+                    # push this down the moment the button was clicked.
+                    attendance_id = self.config.get("current_attendance_id")
+                    if attendance_id:
+                        logger.info("Server requested an immediate sync -- syncing now")
+                        self.sync_service.sync_pending(attendance_id, is_final=False)
 
                 self.tray.update_status(STATUS_MONITORING if self._server_config["monitoringActive"] else STATUS_CHECKED_OUT)
             except ApiError as err:
@@ -221,15 +287,30 @@ class AgentRuntime:
 
     def _flush_and_sync_if_active(self):
         closed = self.aggregator.flush()
+        closed_meeting = self.meeting_aggregator.flush()
         attendance_id = self.config.get("current_attendance_id")
         if closed and attendance_id:
             store.enqueue_event(config_module.DB_PATH, attendance_id, closed)
+        if closed_meeting and attendance_id:
+            store.enqueue_event(config_module.DB_PATH, attendance_id, closed_meeting)
         if attendance_id:
             self.sync_service.final_sync(attendance_id)
             self.config.set("monitoring_active", False)
 
 
 def main():
+    # Dispatched here, before anything else about a normal agent run
+    # starts -- Chrome launches this exact invocation (via the
+    # auto-generated launcher script, see browser_bridge_setup.py's own
+    # register_native_host) as a completely separate, short-lived
+    # process each time it needs to relay a message, not as "the agent"
+    # in its usual sense (no tray icon, no sampling loops, nothing else
+    # here applies to that invocation at all).
+    if "--native-host" in sys.argv:
+        from .native_host import run_native_host
+        run_native_host()
+        return
+
     AgentRuntime().run()
 
 
